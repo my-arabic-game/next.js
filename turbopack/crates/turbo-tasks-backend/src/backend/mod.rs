@@ -5,6 +5,7 @@ mod storage;
 
 use std::{
     borrow::Cow,
+    fmt::{self, Write},
     future::Future,
     hash::BuildHasherDefault,
     mem::take,
@@ -30,6 +31,7 @@ use turbo_tasks::{
     event::{Event, EventListener},
     registry,
     task_statistics::TaskStatisticsApi,
+    trace::TraceRawVcs,
     util::IdFactoryWithReuse,
     CellId, FunctionId, FxDashMap, RawVc, ReadCellOptions, ReadConsistency, SessionId, TaskId,
     TraitTypeId, TurboTasksBackendApi, ValueTypeId, TRANSIENT_TASK_BIT,
@@ -979,9 +981,11 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         if !parent_task.is_transient() {
             let parent_task_type = self.lookup_task_type(parent_task);
             panic!(
-                "Calling transient function {} from persistent function {} is not allowed",
+                "Calling transient function {} from persistent function {} is not allowed. This \
+                 function is transient because of the following stack:\n{}",
                 task_type.get_name(),
-                parent_task_type.map_or("unknown", |t| t.get_name())
+                parent_task_type.map_or("unknown", |t| t.get_name()),
+                self.debug_trace_transient_task(&task_type),
             );
         }
         if let Some(task_id) = self.task_cache.lookup_forward(&task_type) {
@@ -1005,6 +1009,57 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         self.connect_child(parent_task, task_id, turbo_tasks);
 
         task_id
+    }
+
+    /// Generate an object that implements [`fmt::Display`] explaining why the given
+    /// [`CachedTaskType`] is transient.
+    fn debug_trace_transient_task(&self, task_type: &CachedTaskType) -> DebugTraceTransientTask {
+        // it shouldn't be possible to have cycles in tasks, but we could have an exponential blowup
+        // from tracing the same task many times, so use a visited_set
+        fn inner_id(
+            backend: &TurboTasksBackendInner<impl BackingStorage>,
+            task_id: TaskId,
+            visited_set: &mut FxHashSet<TaskId>,
+        ) -> DebugTraceTransientTask {
+            if let Some(task_type) = backend.lookup_task_type(task_id) {
+                if visited_set.contains(&task_id) {
+                    let task_name = task_type.get_name();
+                    DebugTraceTransientTask::Collapsed { task_name }
+                } else {
+                    inner_cached(backend, &task_type, visited_set)
+                }
+            } else {
+                DebugTraceTransientTask::Uncached
+            }
+        }
+        fn inner_cached(
+            backend: &TurboTasksBackendInner<impl BackingStorage>,
+            task_type: &CachedTaskType,
+            visited_set: &mut FxHashSet<TaskId>,
+        ) -> DebugTraceTransientTask {
+            let task_name = task_type.get_name();
+
+            let cause_self = task_type.this.map(|cause_self_raw_vc| {
+                Box::new(inner_id(
+                    backend,
+                    cause_self_raw_vc.get_task_id(),
+                    visited_set,
+                ))
+            });
+            let cause_args = task_type
+                .arg
+                .get_raw_vcs()
+                .into_iter()
+                .map(|raw_vc| inner_id(backend, raw_vc.get_task_id(), visited_set))
+                .collect();
+
+            DebugTraceTransientTask::Cached {
+                task_name,
+                cause_self,
+                cause_args,
+            }
+        }
+        inner_cached(self, task_type, &mut FxHashSet::default())
     }
 
     fn invalidate_task(
@@ -2254,6 +2309,57 @@ impl<B: BackingStorage> Backend for TurboTasksBackend<B> {
 
     fn task_statistics(&self) -> &TaskStatisticsApi {
         &self.0.task_statistics
+    }
+}
+
+enum DebugTraceTransientTask {
+    Cached {
+        task_name: &'static str,
+        cause_self: Option<Box<DebugTraceTransientTask>>,
+        cause_args: Vec<DebugTraceTransientTask>,
+    },
+    /// This representation is used when this task is a duplicate of one previously shown
+    Collapsed {
+        task_name: &'static str,
+    },
+    Uncached,
+}
+
+impl DebugTraceTransientTask {
+    fn fmt_indented(&self, f: &mut fmt::Formatter<'_>, level: usize) -> fmt::Result {
+        f.write_str(&"  ".repeat(level))?;
+        match self {
+            Self::Cached {
+                task_name,
+                cause_self,
+                cause_args,
+            } => {
+                f.write_str(task_name)?;
+                f.write_char('\n')?;
+                if let Some(c) = cause_self {
+                    f.write_str("self arg: ")?;
+                    c.fmt_indented(f, level + 1)?;
+                }
+                for c in cause_args {
+                    f.write_str("arg: ")?;
+                    c.fmt_indented(f, level + 1)?;
+                }
+            }
+            Self::Collapsed { task_name } => {
+                f.write_str(task_name)?;
+                f.write_str(" (collapsed)")?;
+            }
+            Self::Uncached => {
+                f.write_str("unknown transient task (uncached)")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for DebugTraceTransientTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_indented(f, 0)
     }
 }
 
